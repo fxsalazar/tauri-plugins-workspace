@@ -31,7 +31,7 @@ use read_progress_stream::ReadProgressStream;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{LazyLock, Mutex},
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -63,11 +63,9 @@ struct ProgressPayload {
     total: u64,
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 static ARRAY: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static CANCEL_SIGNAL: AtomicBool = AtomicBool::new(false);
+// static CANCEL_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 #[command]
 async fn download(
@@ -76,7 +74,6 @@ async fn download(
     headers: HashMap<String, String>,
     on_progress: Channel<ProgressPayload>,
 ) -> Result<()> {
-    ARRAY.lock().unwrap().insert(url.to_string(), false);
     let client = reqwest::Client::new();
 
     let mut request = client.get(url);
@@ -85,7 +82,6 @@ async fn download(
     for (key, value) in headers {
         request = request.header(&key, value);
     }
-    println!("===>{:?}", ARRAY.lock().unwrap().keys());
 
     let response = request.send().await?;
     if !response.status().is_success() {
@@ -101,6 +97,10 @@ async fn download(
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.try_next().await? {
+        if *ARRAY.lock().unwrap().get(url).unwrap() {
+            ARRAY.lock().unwrap().remove(url);
+            return Err(Error::ContentLength("Download cancelled".to_string()));
+        }
         file.write_all(&chunk).await?;
         let _ = on_progress.send(ProgressPayload {
             progress: chunk.len() as u64,
@@ -159,8 +159,8 @@ fn file_to_body(channel: Channel<ProgressPayload>, file: File) -> reqwest::Body 
 }
 
 #[command]
-fn cancel_active_load() {
-    CANCEL_SIGNAL.store(true, Ordering::SeqCst);
+fn cancel_active_load(url: &str) {
+    ARRAY.lock().unwrap().insert(url.to_string(), true);
 }
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -184,16 +184,19 @@ mod tests {
         mocked_endpoint: Mock,
     }
 
-    // #[tokio::test]
-    // async fn test_cancel() {
-    //     println!("===>{:}", CANCEL_SIGNAL.load(Ordering::SeqCst));
-    //     CANCEL_SIGNAL.store(true, Ordering::SeqCst);
-    //     println!("===>{:}", CANCEL_SIGNAL.load(Ordering::SeqCst));
-    //     println!("===>{:}", ARRAY.lock().unwrap().len());
-    //     ARRAY.lock().unwrap().insert("14".to_string(), false);
-    //     println!("===>{:?}", ARRAY.lock().unwrap().keys());
-    //     println!("===>{:}", ARRAY.lock().unwrap().get("14").unwrap());
-    // }
+    #[tokio::test]
+    async fn test_cancel() {
+        let mocked_server = spawn_server_mocked(200).await;
+        ARRAY
+            .lock()
+            .unwrap()
+            .insert(mocked_server.url.clone(), true);
+        let result = download_file(&mocked_server.url).await;
+        mocked_server.mocked_endpoint.assert();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "Download cancelled");
+        assert_eq!(ARRAY.lock().unwrap().len(), 0);
+    }
 
     #[tokio::test]
     async fn should_error_if_status_not_success() {
