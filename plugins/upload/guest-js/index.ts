@@ -26,7 +26,7 @@ async function upload(
     onProgress.onmessage = progressHandler
   }
 
-  return await invoke('plugin:upload|upload', {
+  return await invoke('plugin:upload|upload|cancel_active_load', {
     id,
     url,
     filePath,
@@ -54,7 +54,7 @@ async function download(
     onProgress.onmessage = progressHandler
   }
 
-  await invoke('plugin:upload|download', {
+  await invoke('plugin:upload|download|cancel_active_load', {
     id,
     url,
     filePath,

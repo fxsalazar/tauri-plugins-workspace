@@ -29,7 +29,10 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use read_progress_stream::ReadProgressStream;
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -60,6 +63,12 @@ struct ProgressPayload {
     total: u64,
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ARRAY: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static CANCEL_SIGNAL: AtomicBool = AtomicBool::new(false);
+
 #[command]
 async fn download(
     url: &str,
@@ -67,6 +76,7 @@ async fn download(
     headers: HashMap<String, String>,
     on_progress: Channel<ProgressPayload>,
 ) -> Result<()> {
+    ARRAY.lock().unwrap().insert(url.to_string(), false);
     let client = reqwest::Client::new();
 
     let mut request = client.get(url);
@@ -75,9 +85,11 @@ async fn download(
     for (key, value) in headers {
         request = request.header(&key, value);
     }
+    println!("===>{:?}", ARRAY.lock().unwrap().keys());
 
     let response = request.send().await?;
     if !response.status().is_success() {
+        ARRAY.lock().unwrap().remove(url);
         return Err(Error::HttpErrorCode(
             response.status().as_u16(),
             response.text().await.unwrap_or_default(),
@@ -96,7 +108,7 @@ async fn download(
         });
     }
     file.flush().await?;
-
+    ARRAY.lock().unwrap().remove(url);
     Ok(())
 }
 
@@ -146,9 +158,18 @@ fn file_to_body(channel: Channel<ProgressPayload>, file: File) -> reqwest::Body 
     ))
 }
 
+#[command]
+fn cancel_active_load() {
+    CANCEL_SIGNAL.store(true, Ordering::SeqCst);
+}
+
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("upload")
-        .invoke_handler(tauri::generate_handler![download, upload])
+        .invoke_handler(tauri::generate_handler![
+            download,
+            upload,
+            cancel_active_load
+        ])
         .build()
 }
 
@@ -163,12 +184,24 @@ mod tests {
         mocked_endpoint: Mock,
     }
 
+    // #[tokio::test]
+    // async fn test_cancel() {
+    //     println!("===>{:}", CANCEL_SIGNAL.load(Ordering::SeqCst));
+    //     CANCEL_SIGNAL.store(true, Ordering::SeqCst);
+    //     println!("===>{:}", CANCEL_SIGNAL.load(Ordering::SeqCst));
+    //     println!("===>{:}", ARRAY.lock().unwrap().len());
+    //     ARRAY.lock().unwrap().insert("14".to_string(), false);
+    //     println!("===>{:?}", ARRAY.lock().unwrap().keys());
+    //     println!("===>{:}", ARRAY.lock().unwrap().get("14").unwrap());
+    // }
+
     #[tokio::test]
     async fn should_error_if_status_not_success() {
         let mocked_server = spawn_server_mocked(400).await;
         let result = download_file(&mocked_server.url).await;
         mocked_server.mocked_endpoint.assert();
         assert!(result.is_err());
+        println!("===>{:?}", ARRAY.lock().unwrap().keys());
     }
 
     #[tokio::test]
